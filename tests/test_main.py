@@ -1,5 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 import main as main_module
@@ -38,7 +39,7 @@ class DummyKiteClient:
         ]
 
     def historical_data(self, instrument_token, from_date, to_date, interval):
-        now = datetime(2026, 8, 4, 10, 30, tzinfo=main_module.IST)
+        now = datetime(2026, 8, 6, 10, 30, tzinfo=main_module.IST)
         candles = []
         for idx in range(25):
             minute = 15 + idx
@@ -89,7 +90,7 @@ def test_scan_requires_login():
 
 
 def test_scan_returns_signal_details(monkeypatch):
-    fixed_now = datetime(2026, 8, 4, 10, 30, tzinfo=main_module.IST)
+    fixed_now = datetime(2026, 8, 6, 10, 30, tzinfo=main_module.IST)
 
     class FrozenDateTime(datetime):
         @classmethod
@@ -97,6 +98,7 @@ def test_scan_returns_signal_details(monkeypatch):
             return fixed_now
 
     monkeypatch.setattr(main_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(main_module, "record_scan", lambda scan, source: None)
     main_module.kite_client = DummyKiteClient()
     client = TestClient(main_module.app)
 
@@ -120,8 +122,91 @@ def test_scan_returns_signal_details(monkeypatch):
     assert payload["conditions"]["pe_ema_trend_confirmed"] is False
 
 
+def test_scan_ignores_incomplete_five_minute_candle(monkeypatch):
+    fixed_now = datetime(2026, 8, 6, 10, 30, tzinfo=main_module.IST)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    class DummyWithIncompleteCandle(DummyKiteClient):
+        def historical_data(self, instrument_token, from_date, to_date, interval):
+            candles = super().historical_data(instrument_token, from_date, to_date, interval)
+            candles.append({
+                "date": fixed_now,
+                "open": 99999.0,
+                "high": 99999.0,
+                "low": 99999.0,
+                "close": 99999.0,
+                "volume": 999999,
+            })
+            return candles
+
+    monkeypatch.setattr(main_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(main_module, "record_scan", lambda scan, source: None)
+    main_module.kite_client = DummyWithIncompleteCandle()
+
+    response = TestClient(main_module.app).get("/paper/scan/NIFTY")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["metrics"]["latest_close"] != 99999.0
+    assert payload["metrics"]["latest_volume"] != 999999
+    assert set(payload["shadow_signals"]) == {"1.0x", "1.2x", "1.5x"}
+
+
+def test_scan_window_is_separate_from_entry_window(monkeypatch):
+    fixed_now = datetime(2026, 8, 6, 14, 45, tzinfo=main_module.IST)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    monkeypatch.setattr(main_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(main_module, "record_scan", lambda scan, source: None)
+    main_module.kite_client = DummyKiteClient()
+    client = TestClient(main_module.app)
+
+    response = client.get("/paper/scan/NIFTY")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["selected_contract"]["trading_symbol"] == "NIFTY24SEP"
+    assert payload["entry_window_open"] is False
+
+
+def test_scan_logging_handles_date_expiry(monkeypatch):
+    fixed_now = datetime(2026, 8, 6, 10, 30, tzinfo=main_module.IST)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    monkeypatch.setattr(main_module, "datetime", FrozenDateTime)
+    scan = {
+        "instrument": "NIFTY",
+        "signal": "CE_SIGNAL",
+        "entry_window_open": True,
+        "selected_contract": {"trading_symbol": "NIFTY24SEP", "expiry": date(2030, 9, 27)},
+        "metrics": {},
+        "conditions": {},
+    }
+
+    record = main_module._flatten_scan_for_report(scan, "MANUAL_API")
+    assert record["contract_expiry"] == "2030-09-27"
+
+
+def test_trial_covers_entire_next_week_and_then_stops():
+    assert main_module.trial_date_allowed(datetime(2026, 8, 10, 10, 0, tzinfo=main_module.IST)) is True
+    assert main_module.trial_date_allowed(datetime(2026, 8, 14, 14, 45, tzinfo=main_module.IST)) is True
+    assert main_module.trial_date_allowed(datetime(2026, 8, 15, 10, 0, tzinfo=main_module.IST)) is False
+
+
 def test_scan_never_selects_options(monkeypatch):
-    fixed_now = datetime(2026, 8, 4, 10, 30, tzinfo=main_module.IST)
+    fixed_now = datetime(2026, 8, 6, 10, 30, tzinfo=main_module.IST)
 
     class FrozenDateTime(datetime):
         @classmethod
@@ -161,6 +246,7 @@ def test_scan_never_selects_options(monkeypatch):
             ]
 
     monkeypatch.setattr(main_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(main_module, "record_scan", lambda scan, source: None)
     main_module.kite_client = DummyKiteClientWithOptions()
     client = TestClient(main_module.app)
 
@@ -171,3 +257,182 @@ def test_scan_never_selects_options(monkeypatch):
     assert payload["selected_contract"]["contract_type"] == "FUT"
     assert payload["selected_contract"]["trading_symbol"] == "NIFTY24SEP"
     assert payload["selected_contract"]["instrument_token"] == 33333
+
+
+def test_background_loop_monitors_positions_every_two_seconds(monkeypatch):
+    calls = []
+
+    class StopLoop(Exception):
+        pass
+
+    class FakeEvent:
+        def wait(self, seconds):
+            calls.append(("wait", seconds))
+            raise StopLoop
+
+    monkeypatch.setattr(main_module, "trial_date_allowed", lambda now: False)
+    monkeypatch.setattr(main_module, "_monitor_open_paper_trades", lambda: calls.append(("monitor", None)))
+    monkeypatch.setattr(main_module.threading, "Event", lambda: FakeEvent())
+
+    with pytest.raises(StopLoop):
+        main_module._run_automatic_scans()
+
+    assert calls == [("monitor", None), ("wait", 2)]
+
+
+def test_profit_trail_arms_above_two_thousand_and_exits_on_pullback(monkeypatch):
+    class QuoteClient:
+        access_token = "token"
+
+        def __init__(self):
+            self.prices = iter((125.0, 119.0))
+
+        def ltp(self, keys):
+            return {keys[0]: {"last_price": next(self.prices)}}
+
+    trade = main_module.PaperTrade(
+        id="trail",
+        instrument="NIFTY",
+        direction="CE",
+        premium_outlay=10000,
+        opened_at="2026-08-12T10:00:00+05:30",
+        option_symbol="TESTCE",
+        quantity=100,
+        entry_price=100.0,
+        current_price=100.0,
+    )
+    monkeypatch.setattr(main_module, "trades", [trade])
+    monkeypatch.setattr(main_module, "kite_client", QuoteClient())
+    monkeypatch.setattr(main_module, "save_trades", lambda: None)
+    monkeypatch.setattr(main_module, "_write_trade_event", lambda event, paper_trade: None)
+    monkeypatch.setattr(main_module, "SQUARE_OFF_TIME", main_module.time(23, 59))
+
+    main_module._monitor_open_paper_trades()
+    assert trade.status == "OPEN"
+    assert trade.pnl == 2500
+    main_module._monitor_open_paper_trades()
+    assert trade.status == "CLOSED"
+    assert trade.pnl == 1900
+    assert trade.exit_reason == "PROFIT_LADDER_2000_FLOOR"
+
+
+def test_early_profit_trail_exits_after_one_thousand_peak(monkeypatch):
+    class QuoteClient:
+        access_token = "token"
+
+        def __init__(self):
+            self.prices = iter((111.0, 110.0))
+
+        def ltp(self, keys):
+            return {keys[0]: {"last_price": next(self.prices)}}
+
+    trade = main_module.PaperTrade(
+        id="early-trail",
+        instrument="NIFTY",
+        direction="CE",
+        premium_outlay=10000,
+        opened_at="2026-08-12T10:00:00+05:30",
+        option_symbol="TESTCE",
+        quantity=100,
+        entry_price=100.0,
+        current_price=100.0,
+    )
+    monkeypatch.setattr(main_module, "trades", [trade])
+    monkeypatch.setattr(main_module, "kite_client", QuoteClient())
+    monkeypatch.setattr(main_module, "save_trades", lambda: None)
+    monkeypatch.setattr(main_module, "_write_trade_event", lambda event, paper_trade: None)
+    monkeypatch.setattr(main_module, "SQUARE_OFF_TIME", main_module.time(23, 59))
+
+    main_module._monitor_open_paper_trades()
+    assert trade.status == "OPEN"
+    assert trade.peak_pnl == 1100
+
+    main_module._monitor_open_paper_trades()
+    assert trade.status == "CLOSED"
+    assert trade.pnl == 1000
+    assert trade.exit_reason == "PROFIT_LADDER_1000_FLOOR"
+
+
+@pytest.mark.parametrize(
+    ("peak_price", "floor_price", "expected_reason"),
+    [
+        (106.0, 105.0, "PROFIT_LADDER_500_FLOOR"),
+        (111.0, 110.0, "PROFIT_LADDER_1000_FLOOR"),
+        (116.0, 115.0, "PROFIT_LADDER_1500_FLOOR"),
+        (121.0, 120.0, "PROFIT_LADDER_2000_FLOOR"),
+        (126.0, 125.0, "PROFIT_LADDER_2500_FLOOR"),
+    ],
+)
+def test_each_profit_ladder_step(monkeypatch, peak_price, floor_price, expected_reason):
+    class QuoteClient:
+        access_token = "token"
+
+        def __init__(self):
+            self.prices = iter((peak_price, floor_price))
+
+        def ltp(self, keys):
+            return {keys[0]: {"last_price": next(self.prices)}}
+
+    trade = main_module.PaperTrade(
+        id="ladder",
+        instrument="NIFTY",
+        direction="CE",
+        premium_outlay=10000,
+        opened_at="2026-08-13T10:00:00+05:30",
+        option_symbol="TESTCE",
+        quantity=100,
+        entry_price=100.0,
+        current_price=100.0,
+    )
+    monkeypatch.setattr(main_module, "trades", [trade])
+    monkeypatch.setattr(main_module, "kite_client", QuoteClient())
+    monkeypatch.setattr(main_module, "save_trades", lambda: None)
+    monkeypatch.setattr(main_module, "_write_trade_event", lambda event, paper_trade: None)
+    monkeypatch.setattr(main_module, "SQUARE_OFF_TIME", main_module.time(23, 59))
+
+    main_module._monitor_open_paper_trades()
+    assert trade.status == "OPEN"
+    main_module._monitor_open_paper_trades()
+    assert trade.status == "CLOSED"
+    assert trade.exit_reason == expected_reason
+
+
+def test_three_simultaneous_positions_and_reopen_after_one_closes(monkeypatch):
+    fixed_now = datetime(2026, 8, 13, 12, 0, tzinfo=main_module.IST)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    selected_option = {
+        "option_symbol": "NIFTYTESTCE",
+        "option_token": 123,
+        "quantity": 100,
+        "entry_price": 320.0,
+        "premium_outlay": 32000.0,
+    }
+    scan = {
+        "instrument": "NIFTY",
+        "signal": "CE_SIGNAL",
+        "entry_window_open": True,
+        "metrics": {"latest_close": 24500.0},
+    }
+    monkeypatch.setattr(main_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(main_module, "trades", [])
+    monkeypatch.setattr(main_module, "_select_paper_option", lambda payload: selected_option)
+    monkeypatch.setattr(main_module, "save_trades", lambda: None)
+    monkeypatch.setattr(main_module, "_write_trade_event", lambda event, trade: None)
+
+    assert main_module._automatic_paper_entry(scan)["status"] == "PAPER_TRADE_OPENED"
+    assert main_module._automatic_paper_entry(scan)["status"] == "PAPER_TRADE_OPENED"
+    assert main_module._automatic_paper_entry(scan)["status"] == "PAPER_TRADE_OPENED"
+    assert main_module.open_positions() == 3
+
+    blocked = main_module._automatic_paper_entry(scan)
+    assert blocked["status"] == "NO_ENTRY"
+    assert "Maximum of three" in blocked["reason"]
+
+    main_module.trades[0].status = "CLOSED"
+    assert main_module._automatic_paper_entry(scan)["status"] == "PAPER_TRADE_OPENED"
+    assert main_module.open_positions() == 3

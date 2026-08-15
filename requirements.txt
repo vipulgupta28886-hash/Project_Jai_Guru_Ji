@@ -1,0 +1,6 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+kiteconnect==5.2.1
+python-dotenv==1.2.2
+pydantic==2.13.4
+pandas==3.0.5
